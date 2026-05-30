@@ -3,12 +3,13 @@
  *
  * Optimizations:
  * 1. 72 blocks → matches A10's 72 SMs for one-wave execution
- * 2. Atomic barrier → avoids cooperative groups launch constraints
+ * 2. Atomic barrier with release-acquire fences → cross-block sync
  * 3. uint4 (128-bit) loads throughout → maximizes memory bandwidth utilization
- * 4. cp.async double-buffering for MLP gate+up → overlaps compute with weight fetch
+ * 4. Direct __ldg MLP gate+up (cp.async disabled due to sm_86 shared mem issue)
  * 5. Shared memory activation caching for MLP → saves redundant global reads
  * 6. Weight prefetch during attention → uses spare blocks to warm L2 for next layer
  * 7. float4 register-cached activations for matvec → reduces instruction count
+ * 8. Block-interleaved embedding → eliminates write-after-write race
  */
 
 #include "config.cuh"
