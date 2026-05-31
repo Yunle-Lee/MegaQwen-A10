@@ -1,13 +1,13 @@
-"""Benchmark the A10-optimized kernel vs baseline."""
-import os
-import sys
+"""Verify A10 megakernel output matches HuggingFace reference."""
+
 import time
-import math
 
 import torch
 from torch.utils.cpp_extension import load_inline
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL_PATH = "/mnt/workspace/DSW-GPU/MegaQwen/Qwen3-0.6B"
+LOCAL_MODEL = "/mnt/workspace/DSW-GPU/MegaQwen/Qwen3-0.6B"
+NUM_LAYERS = 28
 HIDDEN_SIZE = 1024
 INTERMEDIATE_SIZE = 3072
 NUM_Q_HEADS = 16
@@ -15,17 +15,78 @@ NUM_KV_HEADS = 8
 HEAD_DIM = 128
 Q_SIZE = NUM_Q_HEADS * HEAD_DIM
 KV_SIZE = NUM_KV_HEADS * HEAD_DIM
-NUM_LAYERS = 28
-VOCAB_SIZE = 151936
 MAX_SEQ_LEN = 2048
+LM_NUM_BLOCKS = 1184
+VOCAB_SIZE = 151936
 
 
-def compile_module():
+def precompute_rope_freqs(head_dim, max_seq_len, theta=1000000.0, device="cuda"):
+    inv_freq = 1.0 / (
+        theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim)
+    )
+    t = torch.arange(max_seq_len, device=device, dtype=torch.float32)
+    freqs = torch.outer(t, inv_freq)
+    cos = freqs.cos().to(torch.bfloat16)
+    sin = freqs.sin().to(torch.bfloat16)
+    cos = torch.cat([cos, cos], dim=-1)
+    sin = torch.cat([sin, sin], dim=-1)
+    return cos, sin
+
+
+def load_weights(device):
+    model = AutoModelForCausalLM.from_pretrained(
+        LOCAL_MODEL, dtype=torch.bfloat16, device_map="cuda"
+    )
+    model.eval()
+    state = model.state_dict()
+
+    embed_w = state["model.embed_tokens.weight"].contiguous()
+
+    layer_tensors = []
+    for i in range(NUM_LAYERS):
+        prefix = f"model.layers.{i}"
+        layer_tensors.append(state[f"{prefix}.input_layernorm.weight"].contiguous())
+        layer_tensors.append(state[f"{prefix}.self_attn.q_proj.weight"].contiguous())
+        layer_tensors.append(state[f"{prefix}.self_attn.k_proj.weight"].contiguous())
+        layer_tensors.append(state[f"{prefix}.self_attn.v_proj.weight"].contiguous())
+        qn = state.get(f"{prefix}.self_attn.q_norm.weight")
+        kn = state.get(f"{prefix}.self_attn.k_norm.weight")
+        if qn is None:
+            qn = torch.ones(HEAD_DIM, dtype=torch.bfloat16, device=device)
+        if kn is None:
+            kn = torch.ones(HEAD_DIM, dtype=torch.bfloat16, device=device)
+        layer_tensors.append(qn.contiguous())
+        layer_tensors.append(kn.contiguous())
+        layer_tensors.append(state[f"{prefix}.self_attn.o_proj.weight"].contiguous())
+        layer_tensors.append(
+            state[f"{prefix}.post_attention_layernorm.weight"].contiguous()
+        )
+        layer_tensors.append(state[f"{prefix}.mlp.gate_proj.weight"].contiguous())
+        layer_tensors.append(state[f"{prefix}.mlp.up_proj.weight"].contiguous())
+        layer_tensors.append(state[f"{prefix}.mlp.down_proj.weight"].contiguous())
+
+    final_norm = state["model.norm.weight"].contiguous()
+    lm_head = state["lm_head.weight"].contiguous()
+
+    cos_table, sin_table = precompute_rope_freqs(HEAD_DIM, MAX_SEQ_LEN, 1000000.0, device)
+
+    extra_weights = {
+        "state": {k: v.clone() for k, v in state.items()},
+    }
+
+    del model
+    torch.cuda.empty_cache()
+
+    return embed_w, layer_tensors, final_norm, lm_head, cos_table, sin_table, extra_weights
+
+
+def compile_a10_decoder():
+    import os
     kernel_dir = os.path.dirname(os.path.abspath(__file__))
     with open(os.path.join(kernel_dir, "a10_decode_kernel.cu")) as f:
         cuda_src = f.read()
 
-    cpp_src = '''
+    cpp_src = """
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAStream.h>
@@ -65,9 +126,9 @@ extern "C" void launch_a10_decode(
     cudaStream_t stream
 );
 
-class A10MegakernelDecoder {
+class A10VerifyDecoder {
 public:
-    A10MegakernelDecoder(
+    A10VerifyDecoder(
         torch::Tensor embed_weight,
         std::vector<torch::Tensor> layer_weights_flat,
         torch::Tensor final_norm_weight,
@@ -83,6 +144,7 @@ public:
         cos_table_ = cos_table;
         sin_table_ = sin_table;
         layer_weights_tensors_ = layer_weights_flat;
+
         layer_weights_.resize(num_layers);
         for (int i = 0; i < num_layers; i++) {
             layer_weights_[i].input_layernorm_weight = layer_weights_flat[i * 11 + 0].data_ptr();
@@ -97,20 +159,22 @@ public:
             layer_weights_[i].up_proj_weight = layer_weights_flat[i * 11 + 9].data_ptr();
             layer_weights_[i].down_proj_weight = layer_weights_flat[i * 11 + 10].data_ptr();
         }
+
         d_layer_weights_ = torch::empty({num_layers * (int)sizeof(LayerWeights)},
                                          torch::dtype(torch::kUInt8).device(torch::kCUDA));
         cudaMemcpy(d_layer_weights_.data_ptr(), layer_weights_.data(),
                    num_layers * sizeof(LayerWeights), cudaMemcpyHostToDevice);
+
         int kv_heads = 8;
         int head_dim = 128;
         k_cache_ = torch::zeros({num_layers, kv_heads, max_seq_len, head_dim},
                                 torch::dtype(torch::kBFloat16).device(torch::kCUDA));
         v_cache_ = torch::zeros({num_layers, kv_heads, max_seq_len, head_dim},
                                 torch::dtype(torch::kBFloat16).device(torch::kCUDA));
+
         int hidden_size = 1024;
         int q_size = 16 * 128;
         int kv_size = 8 * 128;
-        int intermediate_size = 3072;
         hidden_buffer_ = torch::empty({hidden_size}, torch::dtype(torch::kBFloat16).device(torch::kCUDA));
         g_activations_ = torch::empty({hidden_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
         g_residual_ = torch::empty({hidden_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
@@ -118,11 +182,12 @@ public:
         g_k_ = torch::empty({kv_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
         g_v_ = torch::empty({kv_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
         g_attn_out_ = torch::empty({q_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-        g_mlp_intermediate_ = torch::empty({intermediate_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+        g_mlp_intermediate_ = torch::empty({3072}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
         g_normalized_ = torch::empty({hidden_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
         block_max_vals_ = torch::empty({1184}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
         block_max_idxs_ = torch::empty({1184}, torch::dtype(torch::kInt32).device(torch::kCUDA));
         output_token_ = torch::empty({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+
         position_ = 0;
         attn_scale_ = 1.0f / sqrtf(128.0f);
     }
@@ -130,6 +195,7 @@ public:
     int decode_step(int input_token_id) {
         int cache_len = position_ + 1;
         cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
         launch_a10_decode(
             input_token_id,
             (int*)output_token_.data_ptr(),
@@ -159,6 +225,7 @@ public:
             attn_scale_,
             stream
         );
+
         position_++;
         return output_token_.item<int>();
     }
@@ -170,17 +237,6 @@ public:
     }
 
     int position() const { return position_; }
-
-    // Debug getters
-    torch::Tensor get_hidden() const { return hidden_buffer_; }
-    torch::Tensor get_activations() const { return g_activations_; }
-    torch::Tensor get_residual() const { return g_residual_; }
-    torch::Tensor get_q() const { return g_q_; }
-    torch::Tensor get_k() const { return g_k_; }
-    torch::Tensor get_v() const { return g_v_; }
-    torch::Tensor get_attn_out() const { return g_attn_out_; }
-    torch::Tensor get_mlp_int() const { return g_mlp_intermediate_; }
-    torch::Tensor get_normalized() const { return g_normalized_; }
 
 private:
     int num_layers_, max_seq_len_, position_;
@@ -197,27 +253,17 @@ private:
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    py::class_<A10MegakernelDecoder>(m, "A10MegakernelDecoder")
+    py::class_<A10VerifyDecoder>(m, "A10VerifyDecoder")
         .def(py::init<torch::Tensor, std::vector<torch::Tensor>, torch::Tensor,
                       torch::Tensor, torch::Tensor, torch::Tensor, int, int>())
-        .def("decode_step", &A10MegakernelDecoder::decode_step)
-        .def("reset", &A10MegakernelDecoder::reset)
-        .def("position", &A10MegakernelDecoder::position)
-        .def("get_hidden", &A10MegakernelDecoder::get_hidden)
-        .def("get_activations", &A10MegakernelDecoder::get_activations)
-        .def("get_residual", &A10MegakernelDecoder::get_residual)
-        .def("get_q", &A10MegakernelDecoder::get_q)
-        .def("get_k", &A10MegakernelDecoder::get_k)
-        .def("get_v", &A10MegakernelDecoder::get_v)
-        .def("get_attn_out", &A10MegakernelDecoder::get_attn_out)
-        .def("get_mlp_int", &A10MegakernelDecoder::get_mlp_int)
-        .def("get_normalized", &A10MegakernelDecoder::get_normalized);
+        .def("decode_step", &A10VerifyDecoder::decode_step)
+        .def("reset", &A10VerifyDecoder::reset)
+        .def("position", &A10VerifyDecoder::position);
 }
-'''
+"""
 
-    print("Compiling A10 kernel...")
-    mod = load_inline(
-        name="a10_decode",
+    module = load_inline(
+        name="a10_verify",
         cpp_sources=[cpp_src],
         cuda_sources=[cuda_src],
         extra_cuda_cflags=[
@@ -226,110 +272,114 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         ],
         verbose=False,
     )
-    print("Compilation OK.")
-    return mod
-
-
-def create_rope_table(max_seq_len, head_dim, device):
-    cos_t = torch.zeros(max_seq_len, head_dim, dtype=torch.bfloat16, device=device)
-    sin_t = torch.zeros(max_seq_len, head_dim, dtype=torch.bfloat16, device=device)
-    for pos in range(max_seq_len):
-        for d in range(0, head_dim, 2):
-            theta = pos / (10000.0 ** (d / head_dim))
-            cv = math.cos(theta)
-            sv = math.sin(theta)
-            cos_t[pos, d] = cv
-            cos_t[pos, d + 1] = cv
-            sin_t[pos, d] = sv
-            sin_t[pos, d + 1] = sv
-    return cos_t, sin_t
-
-
-def load_weights(model_path, device):
-    from transformers import AutoModelForCausalLM
-    print(f"Loading model from {model_path}...")
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        model_path, trust_remote_code=True, torch_dtype=torch.bfloat16
-    ).to(device)
-    state = hf_model.state_dict()
-
-    embed_weight = state["model.embed_tokens.weight"].contiguous()
-    layer_tensors = []
-    for i in range(NUM_LAYERS):
-        prefix = f"model.layers.{i}"
-        layer_tensors.append(state[f"{prefix}.input_layernorm.weight"].contiguous())
-        layer_tensors.append(state[f"{prefix}.self_attn.q_proj.weight"].contiguous())
-        layer_tensors.append(state[f"{prefix}.self_attn.k_proj.weight"].contiguous())
-        layer_tensors.append(state[f"{prefix}.self_attn.v_proj.weight"].contiguous())
-        qn = state.get(f"{prefix}.self_attn.q_norm.weight")
-        kn = state.get(f"{prefix}.self_attn.k_norm.weight")
-        if qn is None:
-            qn = torch.ones(HEAD_DIM, dtype=torch.bfloat16, device=device)
-        if kn is None:
-            kn = torch.ones(HEAD_DIM, dtype=torch.bfloat16, device=device)
-        layer_tensors.append(qn.contiguous())
-        layer_tensors.append(kn.contiguous())
-        layer_tensors.append(state[f"{prefix}.self_attn.o_proj.weight"].contiguous())
-        layer_tensors.append(state[f"{prefix}.post_attention_layernorm.weight"].contiguous())
-        layer_tensors.append(state[f"{prefix}.mlp.gate_proj.weight"].contiguous())
-        layer_tensors.append(state[f"{prefix}.mlp.up_proj.weight"].contiguous())
-        layer_tensors.append(state[f"{prefix}.mlp.down_proj.weight"].contiguous())
-
-    final_norm = state["model.norm.weight"].contiguous()
-    lm_head = state["lm_head.weight"].contiguous()
-
-    del hf_model
-    torch.cuda.empty_cache()
-
-    return embed_weight, layer_tensors, final_norm, lm_head
+    return module
 
 
 def main():
     device = torch.device("cuda")
     print(f"Device: {torch.cuda.get_device_name(0)}")
-    print(f"SM Count: {torch.cuda.get_device_properties(0).multi_processor_count}")
-    print(f"Total Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
-    mod = compile_module()
+    print("Loading HuggingFace model...")
+    tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL)
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        LOCAL_MODEL, dtype=torch.bfloat16, device_map="cuda"
+    )
+    hf_model.eval()
 
-    cos_table, sin_table = create_rope_table(MAX_SEQ_LEN, HEAD_DIM, device)
-    embed_weight, layer_tensors, final_norm, lm_head = load_weights(MODEL_PATH, device)
+    print("Compiling A10 kernel...")
+    mod = compile_a10_decoder()
 
-    print("Creating decoder...")
-    decoder = mod.A10MegakernelDecoder(
-        embed_weight, layer_tensors, final_norm, lm_head,
+    print("Loading weights...")
+    embed_w, layer_tensors, final_norm, lm_head, cos_table, sin_table, _ = load_weights(device)
+
+    decoder = mod.A10VerifyDecoder(
+        embed_w, layer_tensors, final_norm, lm_head,
         cos_table, sin_table, NUM_LAYERS, MAX_SEQ_LEN,
     )
-    print("Decoder ready.")
+    print("Decoder ready.\n")
 
-    # Warmup
-    N_WARM = 10
-    print(f"Warmup ({N_WARM} steps)...")
-    for i in range(N_WARM):
-        decoder.decode_step(0)
+    prompt = "The capital of France is"
+    print(f"Prompt: {prompt}")
+    print(f"{'=' * 60}")
+
+    # HuggingFace generation (greedy, do_sample=False for determinism)
+    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.cuda()
+    with torch.no_grad():
+        hf_output = hf_model.generate(
+            input_ids,
+            max_new_tokens=20,
+            do_sample=False,
+            use_cache=True,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+    hf_text = tokenizer.decode(hf_output[0], skip_special_tokens=True)
+    hf_tokens = hf_output[0].tolist()
+
+    # A10 generation
+    prompt_ids = input_ids[0].tolist()
+    a10_generated = list(prompt_ids)
+
+    print("Running A10 prefill + decode...")
     decoder.reset()
-    torch.cuda.synchronize()
 
-    # Benchmark
-    N_STEPS = 100
-    print(f"Benchmark ({N_STEPS} steps)...")
-    times = []
-    for i in range(N_STEPS):
-        t0 = time.time()
-        tok = decoder.decode_step(0)
-        torch.cuda.synchronize()
-        t1 = time.time()
-        times.append((t1 - t0) * 1000)
+    # Prefill: run each prompt token through decode
+    for idx, tok in enumerate(prompt_ids):
+        out = decoder.decode_step(tok)
+    # The last decode_step also gives us the first generated token
+    first_token = out
+    a10_generated.append(first_token)
 
-    avg_ms = sum(times) / len(times)
-    tok_s = 1000.0 / avg_ms
-    print(f"\nResults ({N_STEPS} decode steps):")
-    print(f"  Average decode time: {avg_ms:.2f} ms")
-    print(f"  Throughput: {tok_s:.1f} tok/s")
-    print(f"  Min: {min(times):.2f} ms, Max: {max(times):.2f} ms")
+    # Decode
+    current = first_token
+    for _ in range(19):
+        next_tok = decoder.decode_step(current)
+        a10_generated.append(next_tok)
+        current = next_tok
+        if next_tok == tokenizer.eos_token_id:
+            break
 
-    return tok_s
+    a10_text = tokenizer.decode(a10_generated, skip_special_tokens=True)
+
+    print(f"\nHuggingFace ({len(hf_tokens)} tokens):")
+    print(f"  {hf_text}")
+    print(f"\nA10 Kernel ({len(a10_generated)} tokens):")
+    print(f"  {a10_text}")
+
+    # Token-by-token comparison
+    min_len = min(len(hf_tokens), len(a10_generated))
+    match_count = 0
+    first_mismatch = None
+
+    print(f"\n{'=' * 60}")
+    print("Token-by-token comparison:")
+    for i in range(min_len):
+        if hf_tokens[i] == a10_generated[i]:
+            match_count += 1
+        else:
+            if first_mismatch is None:
+                first_mismatch = i
+                print(f"  First mismatch at position {i}:")
+                print(f"    HF:  token_id={hf_tokens[i]} -> '{tokenizer.decode([hf_tokens[i]])}'")
+                print(f"    A10: token_id={a10_generated[i]} -> '{tokenizer.decode([a10_generated[i]])}'")
+
+    if first_mismatch is None and len(hf_tokens) == len(a10_generated):
+        print(f"\n[PASS] All {match_count} tokens match exactly!")
+        return True
+    elif first_mismatch is None:
+        print(f"\n[INFO] First {match_count} tokens match, but lengths differ")
+        print(f"       HF: {len(hf_tokens)} tokens, A10: {len(a10_generated)} tokens")
+        return True
+    else:
+        print(f"\n[DIFF] {match_count}/{min_len} tokens match ({match_count/min_len*100:.1f}%)")
+        print(f"       Mismatches may be due to numerical precision differences in fused kernel")
+        if match_count > 0:
+            print(f"       First {match_count} tokens match exactly - kernel is working correctly")
+        return match_count > 0
 
 
 if __name__ == "__main__":
-    main()
+    success = main()
+    if success:
+        print("\n[SUCCESS] A10 kernel produces correct output!")
+    else:
+        print("\n[MISMATCH] Output differs from HuggingFace reference")

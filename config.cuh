@@ -3,12 +3,15 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
+#include <cooperative_groups.h>
+
+namespace cg = cooperative_groups;
 
 // =============================================================================
 // A10-Optimized Tunable Parameters
 // =============================================================================
 
-// A10 has 72 SMs → use exactly 72 blocks for one-wave execution
+// A10 has 72 SMs → 1 block per SM for single-wave
 constexpr int NUM_BLOCKS = 72;
 constexpr int BLOCK_SIZE = 256;
 constexpr int NUM_WARPS = BLOCK_SIZE / 32;
@@ -51,6 +54,16 @@ struct LayerWeights {
     const __nv_bfloat16* gate_proj_weight;
     const __nv_bfloat16* up_proj_weight;
     const __nv_bfloat16* down_proj_weight;
+};
+
+struct ScalePointers {
+    float* q_scale;
+    float* k_scale;
+    float* v_scale;
+    float* o_scale;
+    float* gate_scale;
+    float* up_scale;
+    float* down_scale;
 };
 
 // =============================================================================

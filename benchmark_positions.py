@@ -1,13 +1,17 @@
-"""Benchmark the A10-optimized kernel vs baseline."""
-import os
-import sys
-import time
-import math
-
+"""Per-position benchmark for A10-optimized kernel."""
+import gc, json, os, sys, time, warnings, math
+warnings.filterwarnings("ignore")
 import torch
-from torch.utils.cpp_extension import load_inline
 
+PROJECT = os.path.dirname(os.path.abspath(__file__))
+MEGA_PROJECT = "/mnt/workspace/DSW-GPU/MegaQwen"
 MODEL_PATH = "/mnt/workspace/DSW-GPU/MegaQwen/Qwen3-0.6B"
+sys.path.insert(0, PROJECT)
+
+TEST_TOKEN_POSITIONS = [1, 10, 25, 50, 75, 100, 128, 150, 175, 200]
+WARMUP = 2
+RUNS = 3
+
 HIDDEN_SIZE = 1024
 INTERMEDIATE_SIZE = 3072
 NUM_Q_HEADS = 16
@@ -19,9 +23,28 @@ NUM_LAYERS = 28
 VOCAB_SIZE = 151936
 MAX_SEQ_LEN = 2048
 
+def clear():
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    time.sleep(1)
+
+def measure(fn, warmup=WARMUP, runs=RUNS):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(runs):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        fn()
+        torch.cuda.synchronize()
+        times.append(time.perf_counter() - t0)
+    return sum(times)/len(times)
 
 def compile_module():
-    kernel_dir = os.path.dirname(os.path.abspath(__file__))
+    from torch.utils.cpp_extension import load_inline
+    kernel_dir = PROJECT
     with open(os.path.join(kernel_dir, "a10_decode_kernel.cu")) as f:
         cuda_src = f.read()
 
@@ -65,9 +88,9 @@ extern "C" void launch_a10_decode(
     cudaStream_t stream
 );
 
-class A10MegakernelDecoder {
+class A10BenchDecoder {
 public:
-    A10MegakernelDecoder(
+    A10BenchDecoder(
         torch::Tensor embed_weight,
         std::vector<torch::Tensor> layer_weights_flat,
         torch::Tensor final_norm_weight,
@@ -101,87 +124,44 @@ public:
                                          torch::dtype(torch::kUInt8).device(torch::kCUDA));
         cudaMemcpy(d_layer_weights_.data_ptr(), layer_weights_.data(),
                    num_layers * sizeof(LayerWeights), cudaMemcpyHostToDevice);
-        int kv_heads = 8;
-        int head_dim = 128;
+        int kv_heads = 8; int head_dim = 128;
         k_cache_ = torch::zeros({num_layers, kv_heads, max_seq_len, head_dim},
                                 torch::dtype(torch::kBFloat16).device(torch::kCUDA));
         v_cache_ = torch::zeros({num_layers, kv_heads, max_seq_len, head_dim},
                                 torch::dtype(torch::kBFloat16).device(torch::kCUDA));
-        int hidden_size = 1024;
-        int q_size = 16 * 128;
-        int kv_size = 8 * 128;
-        int intermediate_size = 3072;
-        hidden_buffer_ = torch::empty({hidden_size}, torch::dtype(torch::kBFloat16).device(torch::kCUDA));
-        g_activations_ = torch::empty({hidden_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-        g_residual_ = torch::empty({hidden_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-        g_q_ = torch::empty({q_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-        g_k_ = torch::empty({kv_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-        g_v_ = torch::empty({kv_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-        g_attn_out_ = torch::empty({q_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-        g_mlp_intermediate_ = torch::empty({intermediate_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-        g_normalized_ = torch::empty({hidden_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+        hidden_buffer_ = torch::empty({1024}, torch::dtype(torch::kBFloat16).device(torch::kCUDA));
+        g_activations_ = torch::empty({1024}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+        g_residual_ = torch::empty({1024}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+        g_q_ = torch::empty({2048}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+        g_k_ = torch::empty({1024}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+        g_v_ = torch::empty({1024}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+        g_attn_out_ = torch::empty({2048}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+        g_mlp_intermediate_ = torch::empty({3072}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+        g_normalized_ = torch::empty({1024}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
         block_max_vals_ = torch::empty({1184}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
         block_max_idxs_ = torch::empty({1184}, torch::dtype(torch::kInt32).device(torch::kCUDA));
         output_token_ = torch::empty({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
         position_ = 0;
         attn_scale_ = 1.0f / sqrtf(128.0f);
     }
-
     int decode_step(int input_token_id) {
         int cache_len = position_ + 1;
         cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
-        launch_a10_decode(
-            input_token_id,
-            (int*)output_token_.data_ptr(),
-            embed_weight_.data_ptr(),
-            (const LayerWeights*)d_layer_weights_.data_ptr(),
-            final_norm_weight_.data_ptr(),
-            lm_head_weight_.data_ptr(),
-            cos_table_.data_ptr(),
-            sin_table_.data_ptr(),
-            k_cache_.data_ptr(),
-            v_cache_.data_ptr(),
-            hidden_buffer_.data_ptr(),
-            g_activations_.data_ptr(),
-            g_residual_.data_ptr(),
-            g_q_.data_ptr(),
-            g_k_.data_ptr(),
-            g_v_.data_ptr(),
-            g_attn_out_.data_ptr(),
-            g_mlp_intermediate_.data_ptr(),
-            g_normalized_.data_ptr(),
-            block_max_vals_.data_ptr(),
-            block_max_idxs_.data_ptr(),
-            num_layers_,
-            position_,
-            cache_len,
-            max_seq_len_,
-            attn_scale_,
-            stream
-        );
+        launch_a10_decode(input_token_id, (int*)output_token_.data_ptr(),
+            embed_weight_.data_ptr(), (const LayerWeights*)d_layer_weights_.data_ptr(),
+            final_norm_weight_.data_ptr(), lm_head_weight_.data_ptr(),
+            cos_table_.data_ptr(), sin_table_.data_ptr(),
+            k_cache_.data_ptr(), v_cache_.data_ptr(),
+            hidden_buffer_.data_ptr(), g_activations_.data_ptr(), g_residual_.data_ptr(),
+            g_q_.data_ptr(), g_k_.data_ptr(), g_v_.data_ptr(),
+            g_attn_out_.data_ptr(), g_mlp_intermediate_.data_ptr(), g_normalized_.data_ptr(),
+            block_max_vals_.data_ptr(), block_max_idxs_.data_ptr(),
+            num_layers_, position_, cache_len, max_seq_len_, attn_scale_, stream);
         position_++;
         return output_token_.item<int>();
     }
-
-    void reset() {
-        position_ = 0;
-        k_cache_.zero_();
-        v_cache_.zero_();
-    }
-
+    void reset() { position_ = 0; k_cache_.zero_(); v_cache_.zero_(); }
     int position() const { return position_; }
-
-    // Debug getters
-    torch::Tensor get_hidden() const { return hidden_buffer_; }
-    torch::Tensor get_activations() const { return g_activations_; }
-    torch::Tensor get_residual() const { return g_residual_; }
-    torch::Tensor get_q() const { return g_q_; }
-    torch::Tensor get_k() const { return g_k_; }
-    torch::Tensor get_v() const { return g_v_; }
-    torch::Tensor get_attn_out() const { return g_attn_out_; }
-    torch::Tensor get_mlp_int() const { return g_mlp_intermediate_; }
-    torch::Tensor get_normalized() const { return g_normalized_; }
-
 private:
     int num_layers_, max_seq_len_, position_;
     float attn_scale_;
@@ -197,53 +177,25 @@ private:
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    py::class_<A10MegakernelDecoder>(m, "A10MegakernelDecoder")
+    py::class_<A10BenchDecoder>(m, "A10BenchDecoder")
         .def(py::init<torch::Tensor, std::vector<torch::Tensor>, torch::Tensor,
                       torch::Tensor, torch::Tensor, torch::Tensor, int, int>())
-        .def("decode_step", &A10MegakernelDecoder::decode_step)
-        .def("reset", &A10MegakernelDecoder::reset)
-        .def("position", &A10MegakernelDecoder::position)
-        .def("get_hidden", &A10MegakernelDecoder::get_hidden)
-        .def("get_activations", &A10MegakernelDecoder::get_activations)
-        .def("get_residual", &A10MegakernelDecoder::get_residual)
-        .def("get_q", &A10MegakernelDecoder::get_q)
-        .def("get_k", &A10MegakernelDecoder::get_k)
-        .def("get_v", &A10MegakernelDecoder::get_v)
-        .def("get_attn_out", &A10MegakernelDecoder::get_attn_out)
-        .def("get_mlp_int", &A10MegakernelDecoder::get_mlp_int)
-        .def("get_normalized", &A10MegakernelDecoder::get_normalized);
+        .def("decode_step", &A10BenchDecoder::decode_step)
+        .def("reset", &A10BenchDecoder::reset)
+        .def("position", &A10BenchDecoder::position);
 }
 '''
-
-    print("Compiling A10 kernel...")
+    print("Compiling A10 benchmark kernel...")
     mod = load_inline(
-        name="a10_decode",
+        name="a10_bench",
         cpp_sources=[cpp_src],
         cuda_sources=[cuda_src],
-        extra_cuda_cflags=[
-            "-O3", "--use_fast_math", "-std=c++17", "-arch=sm_86",
-            "--expt-relaxed-constexpr", "-I" + kernel_dir,
-        ],
+        extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++17", "-arch=sm_86",
+                           "--expt-relaxed-constexpr", "-I" + kernel_dir],
         verbose=False,
     )
     print("Compilation OK.")
     return mod
-
-
-def create_rope_table(max_seq_len, head_dim, device):
-    cos_t = torch.zeros(max_seq_len, head_dim, dtype=torch.bfloat16, device=device)
-    sin_t = torch.zeros(max_seq_len, head_dim, dtype=torch.bfloat16, device=device)
-    for pos in range(max_seq_len):
-        for d in range(0, head_dim, 2):
-            theta = pos / (10000.0 ** (d / head_dim))
-            cv = math.cos(theta)
-            sv = math.sin(theta)
-            cos_t[pos, d] = cv
-            cos_t[pos, d + 1] = cv
-            sin_t[pos, d] = sv
-            sin_t[pos, d + 1] = sv
-    return cos_t, sin_t
-
 
 def load_weights(model_path, device):
     from transformers import AutoModelForCausalLM
@@ -252,7 +204,6 @@ def load_weights(model_path, device):
         model_path, trust_remote_code=True, torch_dtype=torch.bfloat16
     ).to(device)
     state = hf_model.state_dict()
-
     embed_weight = state["model.embed_tokens.weight"].contiguous()
     layer_tensors = []
     for i in range(NUM_LAYERS):
@@ -263,10 +214,8 @@ def load_weights(model_path, device):
         layer_tensors.append(state[f"{prefix}.self_attn.v_proj.weight"].contiguous())
         qn = state.get(f"{prefix}.self_attn.q_norm.weight")
         kn = state.get(f"{prefix}.self_attn.k_norm.weight")
-        if qn is None:
-            qn = torch.ones(HEAD_DIM, dtype=torch.bfloat16, device=device)
-        if kn is None:
-            kn = torch.ones(HEAD_DIM, dtype=torch.bfloat16, device=device)
+        if qn is None: qn = torch.ones(HEAD_DIM, dtype=torch.bfloat16, device=device)
+        if kn is None: kn = torch.ones(HEAD_DIM, dtype=torch.bfloat16, device=device)
         layer_tensors.append(qn.contiguous())
         layer_tensors.append(kn.contiguous())
         layer_tensors.append(state[f"{prefix}.self_attn.o_proj.weight"].contiguous())
@@ -274,62 +223,62 @@ def load_weights(model_path, device):
         layer_tensors.append(state[f"{prefix}.mlp.gate_proj.weight"].contiguous())
         layer_tensors.append(state[f"{prefix}.mlp.up_proj.weight"].contiguous())
         layer_tensors.append(state[f"{prefix}.mlp.down_proj.weight"].contiguous())
-
     final_norm = state["model.norm.weight"].contiguous()
     lm_head = state["lm_head.weight"].contiguous()
-
     del hf_model
     torch.cuda.empty_cache()
-
     return embed_weight, layer_tensors, final_norm, lm_head
 
-
-def main():
+def benchmark_a10():
+    print("\n=== A10-Optimized Kernel ===")
     device = torch.device("cuda")
-    print(f"Device: {torch.cuda.get_device_name(0)}")
-    print(f"SM Count: {torch.cuda.get_device_properties(0).multi_processor_count}")
-    print(f"Total Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-
     mod = compile_module()
-
-    cos_table, sin_table = create_rope_table(MAX_SEQ_LEN, HEAD_DIM, device)
+    cos_table = torch.zeros(MAX_SEQ_LEN, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    sin_table = torch.zeros(MAX_SEQ_LEN, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    for pos in range(MAX_SEQ_LEN):
+        for d in range(0, HEAD_DIM, 2):
+            theta = pos / (10000.0 ** (d / HEAD_DIM))
+            cos_table[pos, d] = cos_table[pos, d + 1] = math.cos(theta)
+            sin_table[pos, d] = sin_table[pos, d + 1] = math.sin(theta)
     embed_weight, layer_tensors, final_norm, lm_head = load_weights(MODEL_PATH, device)
-
-    print("Creating decoder...")
-    decoder = mod.A10MegakernelDecoder(
+    decoder = mod.A10BenchDecoder(
         embed_weight, layer_tensors, final_norm, lm_head,
         cos_table, sin_table, NUM_LAYERS, MAX_SEQ_LEN,
     )
-    print("Decoder ready.")
+    results = {}
+    for n in TEST_TOKEN_POSITIONS:
+        def gen_fn(n=n):
+            decoder.reset()
+            for _ in range(n):
+                decoder.decode_step(0)
+        t = measure(gen_fn)
+        results[n] = {"tok_s": n/t, "ms_tok": t*1000/n, "time_s": t}
+        print(f"  {n:4d} tok: {n/t:8.1f} tok/s, {t*1000/n:.2f} ms/tok")
+    del decoder; clear()
+    return results
 
-    # Warmup
-    N_WARM = 10
-    print(f"Warmup ({N_WARM} steps)...")
-    for i in range(N_WARM):
-        decoder.decode_step(0)
-    decoder.reset()
-    torch.cuda.synchronize()
+def main():
+    all_results = {}
+    all_results["A10-Optimized"] = benchmark_a10()
+    a10_out = os.path.join(PROJECT, "a10_benchmark_results.json")
+    with open(a10_out, "w") as f:
+        json.dump({"test_positions": TEST_TOKEN_POSITIONS, "results": all_results}, f, indent=2)
+    print(f"\nA10 results saved: {a10_out}")
 
-    # Benchmark
-    N_STEPS = 100
-    print(f"Benchmark ({N_STEPS} steps)...")
-    times = []
-    for i in range(N_STEPS):
-        t0 = time.time()
-        tok = decoder.decode_step(0)
-        torch.cuda.synchronize()
-        t1 = time.time()
-        times.append((t1 - t0) * 1000)
+    # Load existing MegaQwen results
+    mega_results_path = os.path.join(MEGA_PROJECT, "benchmark_results.json")
+    if os.path.exists(mega_results_path):
+        with open(mega_results_path) as f:
+            mega = json.load(f)
+        merged = mega["results"]
+        merged["A10-Optimized"] = all_results["A10-Optimized"]
 
-    avg_ms = sum(times) / len(times)
-    tok_s = 1000.0 / avg_ms
-    print(f"\nResults ({N_STEPS} decode steps):")
-    print(f"  Average decode time: {avg_ms:.2f} ms")
-    print(f"  Throughput: {tok_s:.1f} tok/s")
-    print(f"  Min: {min(times):.2f} ms, Max: {max(times):.2f} ms")
+        combined_out = os.path.join(PROJECT, "combined_benchmark_results.json")
+        with open(combined_out, "w") as f:
+            json.dump({"test_positions": TEST_TOKEN_POSITIONS, "results": merged}, f, indent=2)
+        print(f"Combined results saved: {combined_out}")
 
-    return tok_s
-
+    print("\nDone!")
 
 if __name__ == "__main__":
     main()

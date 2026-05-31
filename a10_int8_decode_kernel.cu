@@ -12,7 +12,7 @@
  * 8. Block-interleaved embedding → eliminates write-after-write race
  */
 
-#include "config.cuh"
+// config.cuh is prepended by bench_int8.py — do not include here
 
 // =============================================================================
 // Embedding Lookup
@@ -41,7 +41,8 @@ __device__ void rmsnorm_qkv(
     int num_blocks,
     const __nv_bfloat16* hidden_in,
     const __nv_bfloat16* norm_weight,
-    const __nv_bfloat16* q_w, const __nv_bfloat16* k_w, const __nv_bfloat16* v_w,
+    const int8_t* __restrict__ q_w, const int8_t* __restrict__ k_w, const int8_t* __restrict__ v_w,
+    const float* __restrict__ q_scale, const float* __restrict__ k_scale, const float* __restrict__ v_scale,
     float* residual_out,
     float* normalized_out,
     float* q_out, float* k_out, float* v_out
@@ -83,7 +84,7 @@ __device__ void rmsnorm_qkv(
     }
     grid.sync();
 
-    // QKV Projection
+    // QKV Projection (INT8 weights)
     constexpr int TOTAL_ROWS = Q_SIZE + KV_SIZE + KV_SIZE;
     int rows_per_block = (TOTAL_ROWS + num_blocks - 1) / num_blocks;
     int row_start = block_id * rows_per_block;
@@ -93,38 +94,44 @@ __device__ void rmsnorm_qkv(
         int m = m_base + warp_id;
         if (m >= row_end) continue;
 
-        const __nv_bfloat16* w_row;
+        const int8_t* w_row;
+        const float* w_scale;
         float* out_ptr;
         if (m < Q_SIZE) {
             w_row = q_w + m * HIDDEN_SIZE;
+            w_scale = q_scale + m;
             out_ptr = q_out + m;
         } else if (m < Q_SIZE + KV_SIZE) {
             w_row = k_w + (m - Q_SIZE) * HIDDEN_SIZE;
+            w_scale = k_scale + (m - Q_SIZE);
             out_ptr = k_out + (m - Q_SIZE);
         } else {
             w_row = v_w + (m - Q_SIZE - KV_SIZE) * HIDDEN_SIZE;
+            w_scale = v_scale + (m - Q_SIZE - KV_SIZE);
             out_ptr = v_out + (m - Q_SIZE - KV_SIZE);
         }
 
         float sum = 0.0f;
         #pragma unroll 4
-        for (int k = lane_id * 8; k < HIDDEN_SIZE; k += WARP_SIZE * 8) {
+        for (int k = lane_id * 16; k < HIDDEN_SIZE; k += WARP_SIZE * 16) {
             uint4 w_u4 = __ldg(reinterpret_cast<const uint4*>(w_row + k));
-            __nv_bfloat16* w_ptr = reinterpret_cast<__nv_bfloat16*>(&w_u4);
+            int8_t* w_ptr = reinterpret_cast<int8_t*>(&w_u4);
             float4 a1 = *reinterpret_cast<const float4*>(normalized_out + k);
             float4 a2 = *reinterpret_cast<const float4*>(normalized_out + k + 4);
-            sum += __bfloat162float(w_ptr[0]) * a1.x
-                 + __bfloat162float(w_ptr[1]) * a1.y
-                 + __bfloat162float(w_ptr[2]) * a1.z
-                 + __bfloat162float(w_ptr[3]) * a1.w
-                 + __bfloat162float(w_ptr[4]) * a2.x
-                 + __bfloat162float(w_ptr[5]) * a2.y
-                 + __bfloat162float(w_ptr[6]) * a2.z
-                 + __bfloat162float(w_ptr[7]) * a2.w;
+            float4 a3 = *reinterpret_cast<const float4*>(normalized_out + k + 8);
+            float4 a4 = *reinterpret_cast<const float4*>(normalized_out + k + 12);
+            sum += (float)(w_ptr[0]) * a1.x + (float)(w_ptr[1]) * a1.y
+                 + (float)(w_ptr[2]) * a1.z + (float)(w_ptr[3]) * a1.w
+                 + (float)(w_ptr[4]) * a2.x + (float)(w_ptr[5]) * a2.y
+                 + (float)(w_ptr[6]) * a2.z + (float)(w_ptr[7]) * a2.w
+                 + (float)(w_ptr[8]) * a3.x + (float)(w_ptr[9]) * a3.y
+                 + (float)(w_ptr[10]) * a3.z + (float)(w_ptr[11]) * a3.w
+                 + (float)(w_ptr[12]) * a4.x + (float)(w_ptr[13]) * a4.y
+                 + (float)(w_ptr[14]) * a4.z + (float)(w_ptr[15]) * a4.w;
         }
 
         sum = warp_reduce_sum(sum);
-        if (lane_id == 0) *out_ptr = sum;
+        if (lane_id == 0) *out_ptr = sum * w_scale[0];
     }
     grid.sync();
 }
@@ -244,7 +251,7 @@ __device__ void attention(
     const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
     float* attn_out,
     int cache_len, int max_seq_len, float attn_scale,
-    const __nv_bfloat16* o_w, const __nv_bfloat16* gate_w, const __nv_bfloat16* up_w
+    const void* o_w, const void* gate_w, const void* up_w
 ) {
     int block_id = blockIdx.x;
     int warp_id = threadIdx.x / WARP_SIZE;
@@ -260,19 +267,19 @@ __device__ void attention(
             int epp = (Q_SIZE * HIDDEN_SIZE) / (npb / 3 + 1);
             int s = pb * epp;
             for (int i = threadIdx.x; i < epp; i += BLOCK_SIZE * 4)
-                dummy += __bfloat162float(__ldg(o_w + s + i));
+                dummy += (float)(__ldg(((const int8_t*)o_w) + s + i));
         } else if (pb < 2 * npb / 3) {
             int a = pb - npb / 3;
             int epp = (HIDDEN_SIZE * INTERMEDIATE_SIZE) / (npb / 3 + 1);
             int s = a * epp;
             for (int i = threadIdx.x; i < epp; i += BLOCK_SIZE * 4)
-                dummy += __bfloat162float(__ldg(gate_w + s + i));
+                dummy += (float)(__ldg(((const int8_t*)gate_w) + s + i));
         } else {
             int a = pb - 2 * npb / 3;
             int epp = (HIDDEN_SIZE * INTERMEDIATE_SIZE) / (npb / 3 + 1);
             int s = a * epp;
             for (int i = threadIdx.x; i < epp; i += BLOCK_SIZE * 4)
-                dummy += __bfloat162float(__ldg(up_w + s + i));
+                dummy += (float)(__ldg(((const int8_t*)up_w) + s + i));
         }
         __shared__ float s_dummy;
         if (threadIdx.x == 0) s_dummy = dummy;
@@ -363,8 +370,10 @@ __device__ void attention(
 __device__ void o_proj_postnorm_mlp(
     cg::grid_group& grid,
     int num_blocks,
-    const __nv_bfloat16* o_w, const __nv_bfloat16* pn_w,
-    const __nv_bfloat16* gate_w, const __nv_bfloat16* up_w, const __nv_bfloat16* down_w,
+    int layer,
+    const int8_t* o_w, const __nv_bfloat16* pn_w,
+    const int8_t* gate_w, const int8_t* up_w, const int8_t* down_w,
+    const ScalePointers* layer_scales,
     const float* attn_out,
     float* residual, float* activations, float* mlp_int,
     __nv_bfloat16* hidden_out
@@ -376,7 +385,7 @@ __device__ void o_proj_postnorm_mlp(
     // Shared memory for activation cache
     __shared__ float s_act[HIDDEN_SIZE];
 
-    // O Projection + residual
+    // O Projection + residual (INT8 weights)
     int hp_block = (HIDDEN_SIZE + num_blocks - 1) / num_blocks;
     int hs = block_id * hp_block;
     int he = min(hs + hp_block, HIDDEN_SIZE);
@@ -385,25 +394,27 @@ __device__ void o_proj_postnorm_mlp(
         int m = m_base + warp_id;
         if (m >= he) continue;
 
-        const __nv_bfloat16* o_row = o_w + m * Q_SIZE;
+        const int8_t* o_row = o_w + m * Q_SIZE;
         float sum = 0.0f;
         #pragma unroll 4
-        for (int k = lane_id * 8; k < Q_SIZE; k += WARP_SIZE * 8) {
+        for (int k = lane_id * 16; k < Q_SIZE; k += WARP_SIZE * 16) {
             uint4 w_u4 = __ldg(reinterpret_cast<const uint4*>(o_row + k));
-            __nv_bfloat16* w_ptr = reinterpret_cast<__nv_bfloat16*>(&w_u4);
+            int8_t* w_ptr = reinterpret_cast<int8_t*>(&w_u4);
             float4 a1 = *reinterpret_cast<const float4*>(attn_out + k);
             float4 a2 = *reinterpret_cast<const float4*>(attn_out + k + 4);
-            sum += __bfloat162float(w_ptr[0]) * a1.x
-                 + __bfloat162float(w_ptr[1]) * a1.y
-                 + __bfloat162float(w_ptr[2]) * a1.z
-                 + __bfloat162float(w_ptr[3]) * a1.w
-                 + __bfloat162float(w_ptr[4]) * a2.x
-                 + __bfloat162float(w_ptr[5]) * a2.y
-                 + __bfloat162float(w_ptr[6]) * a2.z
-                 + __bfloat162float(w_ptr[7]) * a2.w;
+            float4 a3 = *reinterpret_cast<const float4*>(attn_out + k + 8);
+            float4 a4 = *reinterpret_cast<const float4*>(attn_out + k + 12);
+            sum += (float)(w_ptr[0]) * a1.x + (float)(w_ptr[1]) * a1.y
+                 + (float)(w_ptr[2]) * a1.z + (float)(w_ptr[3]) * a1.w
+                 + (float)(w_ptr[4]) * a2.x + (float)(w_ptr[5]) * a2.y
+                 + (float)(w_ptr[6]) * a2.z + (float)(w_ptr[7]) * a2.w
+                 + (float)(w_ptr[8]) * a3.x + (float)(w_ptr[9]) * a3.y
+                 + (float)(w_ptr[10]) * a3.z + (float)(w_ptr[11]) * a3.w
+                 + (float)(w_ptr[12]) * a4.x + (float)(w_ptr[13]) * a4.y
+                 + (float)(w_ptr[14]) * a4.z + (float)(w_ptr[15]) * a4.w;
         }
         sum = warp_reduce_sum(sum);
-        if (lane_id == 0) activations[m] = sum + residual[m];
+        if (lane_id == 0) activations[m] = sum * layer_scales->o_scale[m] + residual[m];
     }
     grid.sync();
 
@@ -461,46 +472,64 @@ __device__ void o_proj_postnorm_mlp(
         int gr1 = gr + 1;
 
         #pragma unroll 4
-        for (int k = lane_id * 8; k < HIDDEN_SIZE; k += WARP_SIZE * 8) {
+        for (int k = lane_id * 16; k < HIDDEN_SIZE; k += WARP_SIZE * 16) {
             float4 a1 = *reinterpret_cast<const float4*>(s_act + k);
             float4 a2 = *reinterpret_cast<const float4*>(s_act + k + 4);
+            float4 a3 = *reinterpret_cast<const float4*>(s_act + k + 8);
+            float4 a4 = *reinterpret_cast<const float4*>(s_act + k + 12);
 
             uint4 gu4 = __ldg(reinterpret_cast<const uint4*>(gate_w + gr * HIDDEN_SIZE + k));
             uint4 uu4 = __ldg(reinterpret_cast<const uint4*>(up_w + gr * HIDDEN_SIZE + k));
-            __nv_bfloat16* gp = reinterpret_cast<__nv_bfloat16*>(&gu4);
-            __nv_bfloat16* up = reinterpret_cast<__nv_bfloat16*>(&uu4);
-            gs0 += __bfloat162float(gp[0]) * a1.x + __bfloat162float(gp[1]) * a1.y
-                 + __bfloat162float(gp[2]) * a1.z + __bfloat162float(gp[3]) * a1.w
-                 + __bfloat162float(gp[4]) * a2.x + __bfloat162float(gp[5]) * a2.y
-                 + __bfloat162float(gp[6]) * a2.z + __bfloat162float(gp[7]) * a2.w;
-            us0 += __bfloat162float(up[0]) * a1.x + __bfloat162float(up[1]) * a1.y
-                 + __bfloat162float(up[2]) * a1.z + __bfloat162float(up[3]) * a1.w
-                 + __bfloat162float(up[4]) * a2.x + __bfloat162float(up[5]) * a2.y
-                 + __bfloat162float(up[6]) * a2.z + __bfloat162float(up[7]) * a2.w;
+            int8_t* gp = reinterpret_cast<int8_t*>(&gu4);
+            int8_t* up = reinterpret_cast<int8_t*>(&uu4);
+            gs0 += (float)(gp[0]) * a1.x + (float)(gp[1]) * a1.y
+                 + (float)(gp[2]) * a1.z + (float)(gp[3]) * a1.w
+                 + (float)(gp[4]) * a2.x + (float)(gp[5]) * a2.y
+                 + (float)(gp[6]) * a2.z + (float)(gp[7]) * a2.w
+                 + (float)(gp[8]) * a3.x + (float)(gp[9]) * a3.y
+                 + (float)(gp[10]) * a3.z + (float)(gp[11]) * a3.w
+                 + (float)(gp[12]) * a4.x + (float)(gp[13]) * a4.y
+                 + (float)(gp[14]) * a4.z + (float)(gp[15]) * a4.w;
+            us0 += (float)(up[0]) * a1.x + (float)(up[1]) * a1.y
+                 + (float)(up[2]) * a1.z + (float)(up[3]) * a1.w
+                 + (float)(up[4]) * a2.x + (float)(up[5]) * a2.y
+                 + (float)(up[6]) * a2.z + (float)(up[7]) * a2.w
+                 + (float)(up[8]) * a3.x + (float)(up[9]) * a3.y
+                 + (float)(up[10]) * a3.z + (float)(up[11]) * a3.w
+                 + (float)(up[12]) * a4.x + (float)(up[13]) * a4.y
+                 + (float)(up[14]) * a4.z + (float)(up[15]) * a4.w;
 
             if (gr1 < i_end) {
                 uint4 gu4_1 = __ldg(reinterpret_cast<const uint4*>(gate_w + gr1 * HIDDEN_SIZE + k));
                 uint4 uu4_1 = __ldg(reinterpret_cast<const uint4*>(up_w + gr1 * HIDDEN_SIZE + k));
-                __nv_bfloat16* gp1 = reinterpret_cast<__nv_bfloat16*>(&gu4_1);
-                __nv_bfloat16* up1 = reinterpret_cast<__nv_bfloat16*>(&uu4_1);
-                gs1 += __bfloat162float(gp1[0]) * a1.x + __bfloat162float(gp1[1]) * a1.y
-                     + __bfloat162float(gp1[2]) * a1.z + __bfloat162float(gp1[3]) * a1.w
-                     + __bfloat162float(gp1[4]) * a2.x + __bfloat162float(gp1[5]) * a2.y
-                     + __bfloat162float(gp1[6]) * a2.z + __bfloat162float(gp1[7]) * a2.w;
-                us1 += __bfloat162float(up1[0]) * a1.x + __bfloat162float(up1[1]) * a1.y
-                     + __bfloat162float(up1[2]) * a1.z + __bfloat162float(up1[3]) * a1.w
-                     + __bfloat162float(up1[4]) * a2.x + __bfloat162float(up1[5]) * a2.y
-                     + __bfloat162float(up1[6]) * a2.z + __bfloat162float(up1[7]) * a2.w;
+                int8_t* gp1 = reinterpret_cast<int8_t*>(&gu4_1);
+                int8_t* up1 = reinterpret_cast<int8_t*>(&uu4_1);
+                gs1 += (float)(gp1[0]) * a1.x + (float)(gp1[1]) * a1.y
+                     + (float)(gp1[2]) * a1.z + (float)(gp1[3]) * a1.w
+                     + (float)(gp1[4]) * a2.x + (float)(gp1[5]) * a2.y
+                     + (float)(gp1[6]) * a2.z + (float)(gp1[7]) * a2.w
+                     + (float)(gp1[8]) * a3.x + (float)(gp1[9]) * a3.y
+                     + (float)(gp1[10]) * a3.z + (float)(gp1[11]) * a3.w
+                     + (float)(gp1[12]) * a4.x + (float)(gp1[13]) * a4.y
+                     + (float)(gp1[14]) * a4.z + (float)(gp1[15]) * a4.w;
+                us1 += (float)(up1[0]) * a1.x + (float)(up1[1]) * a1.y
+                     + (float)(up1[2]) * a1.z + (float)(up1[3]) * a1.w
+                     + (float)(up1[4]) * a2.x + (float)(up1[5]) * a2.y
+                     + (float)(up1[6]) * a2.z + (float)(up1[7]) * a2.w
+                     + (float)(up1[8]) * a3.x + (float)(up1[9]) * a3.y
+                     + (float)(up1[10]) * a3.z + (float)(up1[11]) * a3.w
+                     + (float)(up1[12]) * a4.x + (float)(up1[13]) * a4.y
+                     + (float)(up1[14]) * a4.z + (float)(up1[15]) * a4.w;
             }
         }
         gs0 = warp_reduce_sum(gs0);
         us0 = warp_reduce_sum(us0);
-        if (lane_id == 0) mlp_int[gr] = silu(gs0) * us0;
+        if (lane_id == 0) mlp_int[gr] = silu(gs0 * layer_scales->gate_scale[gr]) * (us0 * layer_scales->up_scale[gr]);
 
         if (gr1 < i_end) {
             gs1 = warp_reduce_sum(gs1);
             us1 = warp_reduce_sum(us1);
-            if (lane_id == 0) mlp_int[gr1] = silu(gs1) * us1;
+            if (lane_id == 0) mlp_int[gr1] = silu(gs1 * layer_scales->gate_scale[gr1]) * (us1 * layer_scales->up_scale[gr1]);
         }
     }
 
@@ -511,25 +540,35 @@ __device__ void o_proj_postnorm_mlp(
         int m = m_base + warp_id;
         if (m >= he) continue;
 
-        const __nv_bfloat16* d_row = down_w + m * INTERMEDIATE_SIZE;
+        const int8_t* d_row = down_w + m * INTERMEDIATE_SIZE;
         float sum = 0.0f;
         #pragma unroll 4
-        for (int k = lane_id * 8; k < INTERMEDIATE_SIZE; k += WARP_SIZE * 8) {
+        for (int k = lane_id * 16; k < INTERMEDIATE_SIZE; k += WARP_SIZE * 16) {
             uint4 d_u4 = __ldg(reinterpret_cast<const uint4*>(d_row + k));
-            __nv_bfloat16* d_ptr = reinterpret_cast<__nv_bfloat16*>(&d_u4);
+            int8_t* d_ptr = reinterpret_cast<int8_t*>(&d_u4);
             float4 m1 = *reinterpret_cast<const float4*>(mlp_int + k);
             float4 m2 = *reinterpret_cast<const float4*>(mlp_int + k + 4);
-            sum += __bfloat162float(d_ptr[0]) * m1.x
-                 + __bfloat162float(d_ptr[1]) * m1.y
-                 + __bfloat162float(d_ptr[2]) * m1.z
-                 + __bfloat162float(d_ptr[3]) * m1.w
-                 + __bfloat162float(d_ptr[4]) * m2.x
-                 + __bfloat162float(d_ptr[5]) * m2.y
-                 + __bfloat162float(d_ptr[6]) * m2.z
-                 + __bfloat162float(d_ptr[7]) * m2.w;
+            float4 m3 = *reinterpret_cast<const float4*>(mlp_int + k + 8);
+            float4 m4 = *reinterpret_cast<const float4*>(mlp_int + k + 12);
+            sum += (float)(d_ptr[0]) * m1.x
+                 + (float)(d_ptr[1]) * m1.y
+                 + (float)(d_ptr[2]) * m1.z
+                 + (float)(d_ptr[3]) * m1.w
+                 + (float)(d_ptr[4]) * m2.x
+                 + (float)(d_ptr[5]) * m2.y
+                 + (float)(d_ptr[6]) * m2.z
+                 + (float)(d_ptr[7]) * m2.w
+                 + (float)(d_ptr[8]) * m3.x
+                 + (float)(d_ptr[9]) * m3.y
+                 + (float)(d_ptr[10]) * m3.z
+                 + (float)(d_ptr[11]) * m3.w
+                 + (float)(d_ptr[12]) * m4.x
+                 + (float)(d_ptr[13]) * m4.y
+                 + (float)(d_ptr[14]) * m4.z
+                 + (float)(d_ptr[15]) * m4.w;
         }
         sum = warp_reduce_sum(sum);
-        if (lane_id == 0) hidden_out[m] = __float2bfloat16(sum + residual[m]);
+        if (lane_id == 0) hidden_out[m] = __float2bfloat16(sum * layer_scales->down_scale[m] + residual[m]);
     }
 
     grid.sync();
@@ -585,6 +624,7 @@ a10_decode_kernel(
     const __nv_bfloat16* __restrict__ embed_weight,
     const LayerWeights* __restrict__ layer_weights,
     const __nv_bfloat16* __restrict__ final_norm_weight,
+    const ScalePointers* __restrict__ scales,
     const __nv_bfloat16* __restrict__ cos_table,
     const __nv_bfloat16* __restrict__ sin_table,
     __nv_bfloat16* __restrict__ k_cache,
@@ -620,7 +660,12 @@ a10_decode_kernel(
 
         rmsnorm_qkv(grid, num_blocks,
                     hidden_buffer, w.input_layernorm_weight,
-                    w.q_proj_weight, w.k_proj_weight, w.v_proj_weight,
+                    (const int8_t*)w.q_proj_weight,
+                    (const int8_t*)w.k_proj_weight,
+                    (const int8_t*)w.v_proj_weight,
+                    scales[layer].q_scale,
+                    scales[layer].k_scale,
+                    scales[layer].v_scale,
                     g_residual, g_normalized,
                     g_q, g_k, g_v);
 
@@ -637,8 +682,12 @@ a10_decode_kernel(
                   w.o_proj_weight, w.gate_proj_weight, w.up_proj_weight);
 
         o_proj_postnorm_mlp(grid, num_blocks,
-                            w.o_proj_weight, w.post_attn_layernorm_weight,
-                            w.gate_proj_weight, w.up_proj_weight, w.down_proj_weight,
+                            layer,
+                            (const int8_t*)w.o_proj_weight, w.post_attn_layernorm_weight,
+                            (const int8_t*)w.gate_proj_weight,
+                            (const int8_t*)w.up_proj_weight,
+                            (const int8_t*)w.down_proj_weight,
+                            &scales[layer],
                             g_attn_out, g_residual, g_activations, g_mlp_intermediate,
                             hidden_buffer);
     }
@@ -652,7 +701,8 @@ a10_decode_kernel(
 
 __global__ void lm_head_phase1(
     const float* __restrict__ hidden,
-    const __nv_bfloat16* __restrict__ weight,
+    const int8_t* __restrict__ weight,
+    const float* __restrict__ lm_head_scale,
     float* __restrict__ block_max_vals,
     int* __restrict__ block_max_idxs
 ) {
@@ -673,22 +723,32 @@ __global__ void lm_head_phase1(
     int local_max_idx = -1;
 
     for (int m = rs + warp_id; m < re; m += LM_BLOCK_SIZE / WARP_SIZE) {
-        const __nv_bfloat16* w_row = weight + m * HIDDEN_SIZE;
+        const int8_t* w_row = weight + m * HIDDEN_SIZE;
         float sum = 0.0f;
         #pragma unroll 4
-        for (int k = lane_id * 8; k < HIDDEN_SIZE; k += WARP_SIZE * 8) {
+        for (int k = lane_id * 16; k < HIDDEN_SIZE; k += WARP_SIZE * 16) {
             uint4 w_u4 = __ldg(reinterpret_cast<const uint4*>(w_row + k));
-            __nv_bfloat16* w_ptr = reinterpret_cast<__nv_bfloat16*>(&w_u4);
-            sum += __bfloat162float(w_ptr[0]) * s_hidden[k]
-                 + __bfloat162float(w_ptr[1]) * s_hidden[k+1]
-                 + __bfloat162float(w_ptr[2]) * s_hidden[k+2]
-                 + __bfloat162float(w_ptr[3]) * s_hidden[k+3]
-                 + __bfloat162float(w_ptr[4]) * s_hidden[k+4]
-                 + __bfloat162float(w_ptr[5]) * s_hidden[k+5]
-                 + __bfloat162float(w_ptr[6]) * s_hidden[k+6]
-                 + __bfloat162float(w_ptr[7]) * s_hidden[k+7];
+            int8_t* w_ptr = reinterpret_cast<int8_t*>(&w_u4);
+            sum += (float)(w_ptr[0]) * s_hidden[k]
+                 + (float)(w_ptr[1]) * s_hidden[k+1]
+                 + (float)(w_ptr[2]) * s_hidden[k+2]
+                 + (float)(w_ptr[3]) * s_hidden[k+3]
+                 + (float)(w_ptr[4]) * s_hidden[k+4]
+                 + (float)(w_ptr[5]) * s_hidden[k+5]
+                 + (float)(w_ptr[6]) * s_hidden[k+6]
+                 + (float)(w_ptr[7]) * s_hidden[k+7]
+                 + (float)(w_ptr[8]) * s_hidden[k+8]
+                 + (float)(w_ptr[9]) * s_hidden[k+9]
+                 + (float)(w_ptr[10]) * s_hidden[k+10]
+                 + (float)(w_ptr[11]) * s_hidden[k+11]
+                 + (float)(w_ptr[12]) * s_hidden[k+12]
+                 + (float)(w_ptr[13]) * s_hidden[k+13]
+                 + (float)(w_ptr[14]) * s_hidden[k+14]
+                 + (float)(w_ptr[15]) * s_hidden[k+15];
         }
         sum = warp_reduce_sum(sum);
+        // Apply per-channel scale
+        sum *= lm_head_scale[m];
         if (lane_id == 0 && sum > local_max) {
             local_max = sum;
             local_max_idx = m;
@@ -758,13 +818,14 @@ __global__ void lm_head_phase2(
 // Launch Function
 // =============================================================================
 
-extern "C" void launch_a10_decode(
+extern "C" void launch_a10_int8_decode(
     int input_token_id,
     int* output_token_id,
     const void* embed_weight,
     const LayerWeights* layer_weights,
     const void* final_norm_weight,
     const void* lm_head_weight,
+    const float* lm_head_scale,
     const void* cos_table,
     const void* sin_table,
     void* k_cache, void* v_cache,
@@ -776,6 +837,7 @@ extern "C" void launch_a10_decode(
     void* block_max_vals, void* block_max_idxs,
     int num_layers, int position, int cache_len,
     int max_seq_len, float attn_scale,
+    const ScalePointers* scales,
     cudaStream_t stream
 ) {
     void* args[] = {
@@ -783,6 +845,7 @@ extern "C" void launch_a10_decode(
         (void*)&embed_weight,
         (void*)&layer_weights,
         (void*)&final_norm_weight,
+        (void*)&scales,
         (void*)&cos_table,
         (void*)&sin_table,
         &k_cache, &v_cache,
@@ -798,13 +861,14 @@ extern "C" void launch_a10_decode(
     dim3 grid(NUM_BLOCKS);
     dim3 block(BLOCK_SIZE);
 
-    cudaLaunchCooperativeKernel(
+    cudaError_t err = cudaLaunchCooperativeKernel(
         (const void*)a10_decode_kernel,
         grid, block, args, 0, stream);
 
     lm_head_phase1<<<LM_NUM_BLOCKS, LM_BLOCK_SIZE, 0, stream>>>(
         (const float*)g_normalized,
-        (const __nv_bfloat16*)lm_head_weight,
+        (const int8_t*)lm_head_weight,
+        lm_head_scale,
         (float*)block_max_vals,
         (int*)block_max_idxs
     );

@@ -78,7 +78,6 @@ extern "C" void launch_a10_decode(
     void* g_q, void* g_k, void* g_v,
     void* g_attn_out, void* g_mlp_intermediate,
     void* g_normalized,
-    void* global_sync_var,
     void* block_max_vals, void* block_max_idxs,
     int num_layers, int position, int cache_len,
     int max_seq_len, float attn_scale,
@@ -146,7 +145,6 @@ public:
         g_attn_out_ = torch::empty({q_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
         g_mlp_intermediate_ = torch::empty({intermediate_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
         g_normalized_ = torch::empty({hidden_size}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-        global_sync_var_ = torch::empty({1}, torch::dtype(torch::kUInt32).device(torch::kCUDA));
         block_max_vals_ = torch::empty({1184}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
         block_max_idxs_ = torch::empty({1184}, torch::dtype(torch::kInt32).device(torch::kCUDA));
         output_token_ = torch::empty({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
@@ -179,7 +177,6 @@ public:
             g_attn_out_.data_ptr(),
             g_mlp_intermediate_.data_ptr(),
             g_normalized_.data_ptr(),
-            global_sync_var_.data_ptr(),
             block_max_vals_.data_ptr(),
             block_max_idxs_.data_ptr(),
             num_layers_,
@@ -200,7 +197,7 @@ public:
 
         launch_a10_decode(
             input_token_id,
-            nullptr,
+            (int*)output_token_.data_ptr(),
             embed_weight_.data_ptr(),
             (const LayerWeights*)d_layer_weights_.data_ptr(),
             final_norm_weight_.data_ptr(),
@@ -218,7 +215,6 @@ public:
             g_attn_out_.data_ptr(),
             g_mlp_intermediate_.data_ptr(),
             g_normalized_.data_ptr(),
-            global_sync_var_.data_ptr(),
             block_max_vals_.data_ptr(),
             block_max_idxs_.data_ptr(),
             num_layers_,
@@ -230,7 +226,7 @@ public:
         );
 
         position_++;
-        return 0;
+        return output_token_.item<int>();
     }
 
     void reset() {
@@ -252,7 +248,6 @@ private:
     torch::Tensor hidden_buffer_, g_activations_, g_residual_;
     torch::Tensor g_q_, g_k_, g_v_, g_attn_out_;
     torch::Tensor g_mlp_intermediate_, g_normalized_;
-    torch::Tensor global_sync_var_;
     torch::Tensor block_max_vals_, block_max_idxs_, output_token_;
 };
 
@@ -329,9 +324,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         self.final_norm_weight = state["model.norm.weight"].contiguous()
         self.lm_head_weight = state["lm_head.weight"].contiguous()
 
-        # Free HF model
-        del hf_model
-        torch.cuda.empty_cache()
+        self.hf_model = hf_model
 
     def _allocate_buffers(self):
         # RoPE tables
@@ -364,44 +357,39 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     def generate(self, prompt: str, max_new_tokens: int = 128, temperature: float = 0.0):
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
-        seq_len = input_ids.shape[1]
-        print(f"Prompt: {prompt!r}  ({seq_len} tokens)")
+        prompt_ids = input_ids[0].tolist()
+        prompt_len = len(prompt_ids)
+        print(f"Prompt: {prompt!r}  ({prompt_len} tokens)")
 
         self.reset()
-        generated = input_ids[0].tolist()
 
-        # Prefill
-        with torch.inference_mode():
-            past_key_values = None
-            with torch.no_grad():
-                outputs = AutoModelForCausalLM.from_pretrained(
-                    MODEL_PATH, trust_remote_code=True, torch_dtype=torch.bfloat16
-                ).to(self.device)(
-                    input_ids=input_ids, use_cache=True, output_attentions=False
-                )
-                past_key_values = outputs.past_key_values
+        prefill_start = time.time()
+        for position, token_id in enumerate(prompt_ids):
+            self.decoder.decode_step(token_id)
+        prefill_time = time.time() - prefill_start
 
-            # Copy prefill KV cache to our decoder's cache
-            for layer_idx in range(NUM_LAYERS):
-                k, v = past_key_values[layer_idx]
-                my_k = self.decoder._module_handle  # Can't easily access internal buffers
-
-        # For now, just use our decoder for decode (need prefill separately)
-        # Run decode steps
+        generated = list(prompt_ids)
         decode_times = []
-        for step in range(max_new_tokens):
+
+        decode_start = time.time()
+        current_token = prompt_ids[-1]
+        for _ in range(max_new_tokens):
             t0 = time.time()
-            next_token = self.decoder.decode_step(generated[-1])
+            next_token = self.decoder.decode_step(current_token)
             torch.cuda.synchronize()
             t1 = time.time()
             decode_times.append((t1 - t0) * 1000)
             generated.append(next_token)
+            current_token = next_token
             if next_token == self.tokenizer.eos_token_id:
                 break
+        decode_time = time.time() - decode_start
 
         output_text = self.tokenizer.decode(generated, skip_special_tokens=True)
-        avg_ms = sum(decode_times) / len(decode_times)
+        avg_ms = sum(decode_times) / len(decode_times) if decode_times else 0
         tok_s = 1000.0 / avg_ms if avg_ms > 0 else 0
+        print(f"  prefill: {prompt_len} tok @ {prompt_len/prefill_time:.0f} tok/s | "
+              f"decode: {len(generated)-prompt_len} tok @ {tok_s:.0f} tok/s")
         return output_text, tok_s, decode_times
 
 

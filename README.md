@@ -1,19 +1,56 @@
 # MegaQwen-A10
 
-**A10 优化的 Qwen3-0.6B 融合解码内核**
+**NVIDIA A10 优化 Qwen3-0.6B 纯 CUDA 融合解码内核 — 支持 BF16 & INT8**
 
-基于 NVIDIA A10 (sm_86, 24GB, 72 SMs) 的纯 CUDA 手写推理内核，使用原子计数器实现跨块同步的单波次 decode 内核。
+基于 A10 (sm_86, 72 SMs, 24GB) 的手写 CUDA 推理内核，cooperative groups 单波次 decode + 全 INT8 权重量化。
+
+---
 
 ## 性能
 
-| 方案 | 吞吐量 (tok/s) | 硬件 |
-|------|----------------|------|
-| **本内核** | **~353** | **A10** |
-| MegaQwen v4 基线 | ~199 | A10 |
-| llama.cpp BF16 | ~266 | A10 |
-| llama.cpp Q4_K_M | ~438 | A10 |
-| vLLM (Eager) | ~158 | A10 |
-| HuggingFace | ~37 | A10 |
+### 总体对比
+
+| 方案 | 精度 | 吞吐量 (tok/s) | vs BF16 |
+|------|------|----------------|---------|
+| **MegaQwen-A10 INT8** | INT8 | **~490** | **1.47x** |
+| **MegaQwen-A10 BF16** | BF16 | **~340** | 1.00x |
+| MegaQwen v4 基线 (3090→A10) | BF16 | ~199 | — |
+| llama.cpp BF16 | BF16 | ~249 | — |
+| llama.cpp Q4_K_M | Q4_K_M | ~438 | — |
+| vLLM (Eager) | BF16 | ~158 | — |
+| HuggingFace | BF16 | ~37 | — |
+
+### 位置相关吞吐量
+
+![INT8 vs BF16 Benchmark](int8_benchmarks.png)
+
+| Token Position | INT8 (tok/s) | BF16 (tok/s) | Speedup |
+|:---:|:---:|:---:|:---:|
+| 1 | 425 | 303 | 1.40x |
+| 25 | 525 | 350 | 1.50x |
+| 50 | 516 | 347 | 1.49x |
+| 100 | 497 | 337 | 1.47x |
+| 200 | 463 | 322 | 1.44x |
+
+---
+
+## INT8 量化方案
+
+### 量化策略
+
+- **Per-ouput-channel symmetric quantization**: `scale[j] = absmax(W[j,:]) / 127`
+- **量化范围**: 全部线性投影层 (Q / K / V / O / Gate / Up / Down) + LM Head
+- **保持 BF16**: Embedding、RMSNorm、RoPE tables、KV cache
+- **Int8 GEMM 展开**: 每 `uint4` (128-bit) load 处理 16 个 int8 权重 × 16 个 float 激活值
+
+### 内存带宽节省
+
+| | BF16 | INT8 | 节省 |
+|------|------|------|------|
+| 每 step 内存读取 | ~1192 MB | ~595 MB | **50%** |
+| 全权重存储 | ~1.2 GB | ~0.6 GB | **50%** |
+
+---
 
 ## 架构
 
@@ -25,93 +62,93 @@
          RMSNorm → QKV → RoPE+Cache → Attention → O Proj → PostNorm → MLP → Down Proj
 ```
 
-**单波次设计**: 72 个 block 精确匹配 A10 的 72 个 SM，每 SM 一个 block，无跨波次调度开销。
+**单波次设计**: 72 个 block 精确匹配 A10 的 72 个 SM，每 SM 一个 block，cooperative groups 同步。
 
-## 内核流水线
+## 内核流水线（每层）
 
 | 阶段 | 函数 | 参与的 block | 同步点 |
 |------|------|-------------|--------|
-| 1 | `embed_lookup` | 全部 72 个 | 1 个 barrier |
-| 2 | `rmsnorm_step` | block 0 做计算，其余空转 | 1 个 barrier |
-| 3 | `qkv_proj` | 全部 72 个（分布式行） | 1 个 barrier |
-| 4 | `qk_norm_rope_cache` | block 0-15 处理 Q，0-7 处理 K+缓存 | 1 个 barrier |
-| 5 | `attention` | block 0-15 做注意力，16-71 做权重预取 | 1 个 barrier |
-| 6 | `o_proj_postnorm_mlp` | 全部 72 个（O 投影分布式）→ block 0 PostNorm → 全部 72 个（MLP）→ 全部 72 个（Down） | 4 个 barrier |
-| 7 | `final_rmsnorm` | block 0 仅 | 无 barrier |
-| 8 | LM Head (phase1+2) | 独立内核启动 | 无 |
+| 1 | `rmsnorm_qkv` | block 0 RMSNorm → 全部 72 QKV 投影 | 2 个 barrier |
+| 2 | `qk_norm_rope_cache` | 全部 72 (分布式 Q/K heads + KV cache 写) | 1 个 barrier |
+| 3 | `attention` | block 0-15 做注意力; 16-71 L2 权重预取 | 1 个 barrier |
+| 4 | `o_proj_postnorm_mlp` | 全部 72 (O投影 + PostNorm + Gate/Up + Down) | 4 个 barrier |
 
-每个层共 5 个 barrier 点。28 层 + embed + final = 143 个 barrier 调用。
+28 层 × 5 barrier + embed(1) + final = 141 个 `grid.sync()` 调用。
 
 ## 优化技术
 
-### 已实现的优化
+1. **全 INT8 权重量化** — 全部线性层使用 int8 权重 + per-channel float scale；matvec 内联反量化，无额外 kernel launch
+2. **72 块单波次发射** — `NUM_BLOCKS=72` 精确匹配 A10 的 72 SM
+3. **Cooperative Groups 同步** — `cg::this_grid()` + `grid.sync()` 跨 block 同步
+4. **uint4/float4 向量化** — 128-bit 加载: int8 版本每 load 处理 16 个 int8 × 16 个 float 激活；BF16 版本每 load 8 个 bf16 × 8 个 float
+5. **共享内存激活缓存** — MLP gate+up 从 `s_act` 读取，避免重复全局加载
+6. **权重预取** — 空闲 block (16-71) 在 attention 阶段预取下一层权重到 L2
+7. **RMSNorm + QKV 融合** — block 0 做 RMSNorm → 全部 block 做 QKV 投影，节省 1 个 barrier
+8. **O投影 + PostNorm + MLP 流水线** — 三阶段融合在单函数内，共享同步点
+9. **`--use_fast_math`** — 浮点融合优化
 
-1. **72 块单波次发射** — `NUM_BLOCKS=72` 精确匹配 A10 的 72 SM，无跨波次干扰
-2. **原子计数器 barrier** — 使用 `atomicAdd` 实现滚动计数同步，无需 Cooperative Groups 启动约束
-3. **块交错式 Embedding** — `blockIdx.x * BLOCK_SIZE + threadIdx.x` 索引，消除写竞争
-4. **Release-Acquire 内存屏障** — `__threadfence()` 在 barrier 前后确保跨 block 可见性：
-   - 所有线程 `__threadfence()`（release）→ thread 0 `atomicAdd` → 忙等 → `__syncthreads()` → 所有线程 `__threadfence()`（acquire）
-5. **uint4/float4 向量化加载** — 所有矩阵-向量乘使用 128-bit 加载（每次加载 8 个 bf16 权重 + 8 个 float 激活）
-6. **共享内存激活缓存** — MLP gate+up 从共享内存 `s_act` 读取激活值，避免重复全局加载
-7. **权重预取** — 空闲 block（16-71）在注意力阶段预取下一层的 O/gate/up 权重到 L2
-8. **浮点融合** — `--use_fast_math` 启用快速数学运算
-9. **块级工作分配** — 按 `ceil(n / num_blocks)` 切分行范围，负载均衡
-
-### 待实现/修复的优化
-
-1. **cp.async MLP 双缓冲** — `__pipeline_memcpy_async` 实现的门+上投影重叠加载与计算。**当前禁用**（导致非确定性），替换为直接 `__ldg` 全局内存加载。根本原因推测是 `__pipeline_wait_prior` + `__syncthreads` 在 sm_86 上共享内存可见性问题
-2. **MLP_TILE_ROWS=8 和大共享内存** — 当前限制为 48 KB 默认共享内存。使用 `cudaFuncSetAttribute` 可启用 99 KB opt-in 共享内存，恢复 `MLP_TILE_ROWS=8`
-3. **向量化 Embedding 和 RMSNorm** — 当前使用标量逐元素循环。可恢复为 uint4 向量化加载
-4. **张量核心注意力** — 当前使用纯 warp 级归约，未使用 Tensor Core
+---
 
 ## 关键文件
 
 | 文件 | 说明 |
 |------|------|
-| `a10_decode_kernel.cu` | 主内核源码（融合解码 + LM head） |
-| `config.cuh` | 配置常量、barrier 实现、工具函数 |
-| `run_benchmark.py` | PyTorch `load_inline` 编译 + 模型加载 + 基准测试 |
-| `a10_decode.py` | 简化的 benchmark 启动脚本 |
-| `attention.cuh` | (参考) 注意力实现 |
-| `matvec.cuh` | (参考) 矩阵-向量乘实现 |
-| `rmsnorm.cuh` | (参考) RMSNorm 实现 |
-| `rope.cuh` | (参考) RoPE 实现 |
-| `minimal_test.py` | 最小 barrier 确定性测试 |
-| `minimal_test2.py` | 扩展确定性测试 |
+| `a10_decode_kernel.cu` | **BF16 融合解码内核**（生产版本） |
+| `a10_int8_decode_kernel.cu` | **INT8 融合解码内核**（全部线性层 int8 量化） |
+| `config.cuh` | 配置常量 / `LayerWeights` / `ScalePointers` 结构体 |
+| `a10_decode.py` | BF16 解码器类 + benchmark |
+| `bench_int8.py` | INT8 权重量化 + 编译 + benchmark（含 C++ wrapper） |
+| `int8_decoder.py` | Triton-based INT8 GEMV 微基准（学术参考） |
+| `gen_int8_kernel.py` | BF16 → INT8 内核源码转换工具 |
+| `build_int8_kernel.py` | INT8 内核构建流水线（备用方案） |
+| `run_benchmark.py` | BF16 benchmark 启动器 |
+| `run_int8_bench.py` | INT8 独立 benchmark 启动器 |
+| `bench_and_plot_int8.py` | INT8+BF16 全位置 benchmark + 曲线图绘制 |
+| `benchmark_positions.py` | 位置相关 benchmark |
+| `verify_correctness_a10.py` | 正确性验证（vs HuggingFace） |
+| `demo.py` | 快速演示脚本 |
+| `a10_chat.py` | 交互式对话 |
+| `attention.cuh` / `matvec.cuh` / `rmsnorm.cuh` / `rope.cuh` | 参考实现 |
+| `minimal_test.py` / `minimal_test2.py` | Barrier 确定性测试 |
+
+---
 
 ## 运行
 
 ```bash
-# 确保模型路径正确（默认 /mnt/workspace/DSW-GPU/MegaQwen/Qwen3-0.6B）
-# 运行 benchmark
-python run_benchmark.py
+# INT8 benchmark（全量化）
+python bench_and_plot_int8.py
 
-# 或直接使用 decode 脚本
+# BF16 benchmark
 python a10_decode.py
+
+# 单次正确性验证
+python verify_correctness_a10.py
 ```
 
-## 依赖
-
+**依赖**：
 - CUDA 12.8+
 - PyTorch 2.10.0+ (cu128)
-- Python 3.12+
+- transformers
 - NVIDIA A10 (sm_86) 或兼容 GPU
 
-## 确定性调试记录
+**模型路径**：默认 `/mnt/workspace/DSW-GPU/MegaQwen/Qwen3-0.6B`（需预先下载 HuggingFace Qwen3-0.6B 权重）
 
-内核曾因跨 block 非确定性卡住多日。排查路径：
+---
 
-1. ❌ `MINIMAL_BARRIER_TEST` (72 blocks, embed + barrier + double) → 确定性的 → barrier 本身没坏
-2. ❌ 加 Release-Acquire fence 到 barrier → 仍然非确定性
-3. ❌ 改 embed_lookup 为块交错式 → 仍然非确定性
-4. ✅ **去掉 cp.async MLP 双缓冲** → 变为确定性 → 根因定位为 `__pipeline_memcpy_async` 的共享内存可见性问题
-5. ✅ 验证正确性：1 层输出 1878、28 层输出 21806，均匹配 HF 参考
+## INT8 正确性
 
-## 注意事项
+| 指标 | 结果 |
+|------|------|
+| 单 matvec 相对误差 | ~0.8–1.5% |
+| 单 matvec cos_sim | > 0.99986 |
+| BF16 vs INT8 首个 token 匹配 | 100% (20/20) |
+| 30 token 生成匹配率 | ~97% (量化误差累积) |
 
-- `cuda_pipeline.h` 仍被 `config.cuh` 包含（cp.async 相关），尽管当前未使用
-- `async_load_tile` 函数保留为参考，可恢复 cp.async 时使用
-- `.bak` 文件是调试过程中的备份，不包含在 git 中
-- 模型权重需从 HuggingFace 下载并放置在 `MODEL_PATH` 中
-- 当前仅支持 bfloat16 精度权重，int8/int4 量化未实现
-- 内核使用 `__launch_bounds__(256, 1)` 限制每 SM 一个 block，共享内存占用约 44 KB
+---
+
+## Known Issues
+
+- `cp.async` MLP 双缓冲在 sm_86 上导致非确定性，已禁用（使用直接 `__ldg`）
+- 当前 attention 为纯 warp 归约，未使用 Tensor Core — **这是主要剩余瓶颈**
+- INT8 attention 预取对 `o_w` 使用了 `int8_t*` 强制转换（仅用于 L2 缓存预热，不影响正确性）
